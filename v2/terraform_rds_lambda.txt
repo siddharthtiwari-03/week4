@@ -1,0 +1,274 @@
+################################################################################
+# 0. DATA SOURCES FOR EXISTING RDS
+#
+# These data sources reference your existing RDS instance and related resources.
+# Update the values to match your actual RDS setup.
+################################################################################
+
+# Reference your existing RDS instance
+data "aws_db_instance" "existing_rds" {
+  # Replace with your actual RDS instance identifier
+  db_instance_identifier = "your-rds-instance-name"
+}
+
+# Reference the VPC where your RDS instance is located
+data "aws_vpc" "rds_vpc" {
+  id = data.aws_db_instance.existing_rds.vpc_security_groups[0] != "" ? data.aws_security_group.rds_sg.vpc_id : null
+}
+
+# Reference the existing RDS security group
+data "aws_security_group" "rds_sg" {
+  # Replace with your RDS security group ID or use a filter
+  id = "sg-your-rds-security-group-id"
+  
+  # Alternative: use a filter if you don't know the exact ID
+  # filter {
+  #   name   = "group-name"
+  #   values = ["your-rds-security-group-name"]
+  # }
+}
+
+# Get subnets in the same VPC as RDS (for Lambda VPC configuration)
+data "aws_subnets" "rds_subnets" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.rds_vpc.id]
+  }
+  
+  # Optional: filter for private subnets if your RDS is in private subnets
+  filter {
+    name   = "tag:Type"
+    values = ["private"]
+  }
+}
+
+################################################################################
+# 1. IAM ROLE FOR LAMBDA (ENHANCED)
+#
+# This section creates the execution role for the Lambda function with
+# additional permissions for VPC access and Secrets Manager.
+################################################################################
+
+resource "aws_iam_role" "lambda_exec_role" {
+  name = "api-gateway-lambda-exec-role"
+
+  assume_role_policy = jsonencode({
+    Version   = "2012-10-17",
+    Statement = [{
+      Action    = "sts:AssumeRole",
+      Effect    = "Allow",
+      Principal = {
+        Service = "lambda.amazonaws.com"
+      }
+    }]
+  })
+}
+
+# VPC execution policy for Lambda to run in VPC
+resource "aws_iam_role_policy_attachment" "lambda_vpc_policy" {
+  role       = aws_iam_role.lambda_exec_role.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole"
+}
+
+# Policy for accessing Secrets Manager (for database credentials)
+resource "aws_iam_role_policy" "lambda_secrets_policy" {
+  name = "lambda-secrets-access"
+  role = aws_iam_role.lambda_exec_role.id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "secretsmanager:GetSecretValue"
+        ]
+        Resource = aws_secretsmanager_secret.db_credentials.arn
+      }
+    ]
+  })
+}
+
+################################################################################
+# 1.5. SECRETS MANAGER FOR DATABASE CREDENTIALS
+#
+# Store your database credentials securely in AWS Secrets Manager.
+################################################################################
+
+resource "aws_secretsmanager_secret" "db_credentials" {
+  name        = "rds-lambda-credentials"
+  description = "Database credentials for Lambda function"
+}
+
+resource "aws_secretsmanager_secret_version" "db_credentials" {
+  secret_id = aws_secretsmanager_secret.db_credentials.id
+  secret_string = jsonencode({
+    username = "your-db-username"      # Replace with your actual username
+    password = "your-db-password"      # Replace with your actual password
+    host     = data.aws_db_instance.existing_rds.endpoint
+    port     = data.aws_db_instance.existing_rds.port
+    database = "your-database-name"    # Replace with your actual database name
+  })
+}
+
+################################################################################
+# 1.7. SECURITY GROUP FOR LAMBDA
+#
+# Create a security group for the Lambda function that allows outbound
+# connections to the RDS instance.
+################################################################################
+
+resource "aws_security_group" "lambda_sg" {
+  name_prefix = "lambda-rds-access"
+  description = "Security group for Lambda function to access RDS"
+  vpc_id      = data.aws_vpc.rds_vpc.id
+
+  # Allow outbound connections to RDS
+  egress {
+    from_port   = data.aws_db_instance.existing_rds.port
+    to_port     = data.aws_db_instance.existing_rds.port
+    protocol    = "tcp"
+    security_groups = [data.aws_security_group.rds_sg.id]
+  }
+
+  # Allow outbound HTTPS for Secrets Manager and other AWS services
+  egress {
+    from_port   = 443
+    to_port     = 443
+    protocol    = "tcp"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = "lambda-rds-access"
+  }
+}
+
+# Update RDS security group to allow inbound connections from Lambda
+resource "aws_security_group_rule" "rds_allow_lambda" {
+  type                     = "ingress"
+  from_port                = data.aws_db_instance.existing_rds.port
+  to_port                  = data.aws_db_instance.existing_rds.port
+  protocol                 = "tcp"
+  source_security_group_id = aws_security_group.lambda_sg.id
+  security_group_id        = data.aws_security_group.rds_sg.id
+}
+
+################################################################################
+# 2. LAMBDA FUNCTION (ENHANCED)
+#
+# This defines the Lambda function with VPC configuration and environment
+# variables for database connection.
+################################################################################
+
+data "archive_file" "lambda_zip" {
+  type        = "zip"
+  source_dir  = "${path.module}/app"
+  output_path = "${path.module}/lambda_payload.zip"
+}
+
+resource "aws_lambda_function" "api_handler_lambda" {
+  filename         = data.archive_file.lambda_zip.output_path
+  function_name    = "MyApiHandlerFunction"
+  role             = aws_iam_role.lambda_exec_role.arn
+  handler          = "index.handler"
+  source_code_hash = data.archive_file.lambda_zip.output_base64sha256
+  runtime          = "nodejs18.x"
+  timeout          = 30  # Increased timeout for database operations
+
+  # VPC Configuration to access RDS
+  vpc_config {
+    subnet_ids         = data.aws_subnets.rds_subnets.ids
+    security_group_ids = [aws_security_group.lambda_sg.id]
+  }
+
+  # Environment variables
+  environment {
+    variables = {
+      DB_SECRET_ARN = aws_secretsmanager_secret.db_credentials.arn
+      NODE_ENV      = "production"
+    }
+  }
+
+  tags = {
+    Environment = "production"
+    ManagedBy   = "Terraform"
+  }
+}
+
+################################################################################
+# 3. API GATEWAY & INTEGRATION (UNCHANGED)
+#
+# This section remains the same as your original code.
+################################################################################
+
+resource "aws_api_gateway_rest_api" "app_api" {
+  name        = "ServerlessAppApi"
+  description = "API for handling application requests"
+}
+
+resource "aws_api_gateway_method" "get_method" {
+  rest_api_id   = aws_api_gateway_rest_api.app_api.id
+  resource_id   = aws_api_gateway_rest_api.app_api.root_resource_id
+  http_method   = "GET"
+  authorization = "NONE"
+}
+
+resource "aws_api_gateway_integration" "lambda_integration" {
+  rest_api_id = aws_api_gateway_rest_api.app_api.id
+  resource_id = aws_api_gateway_rest_api.app_api.root_resource_id
+  http_method = aws_api_gateway_method.get_method.http_method
+
+  integration_http_method = "POST"
+  type                    = "AWS_PROXY"
+  uri                     = aws_lambda_function.api_handler_lambda.invoke_arn
+}
+
+resource "aws_lambda_permission" "api_gateway_permission" {
+  statement_id  = "AllowAPIGatewayToInvokeLambda"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.api_handler_lambda.function_name
+  principal     = "apigateway.amazonaws.com"
+  source_arn    = "${aws_api_gateway_rest_api.app_api.execution_arn}/*/${aws_api_gateway_method.get_method.http_method}"
+}
+
+resource "aws_api_gateway_deployment" "api_deployment" {
+  rest_api_id = aws_api_gateway_rest_api.app_api.id
+
+  triggers = {
+    redeployment = sha1(jsonencode([
+      aws_api_gateway_rest_api.app_api.root_resource_id,
+      aws_api_gateway_method.get_method.id,
+      aws_api_gateway_integration.lambda_integration.id,
+    ]))
+  }
+
+  lifecycle {
+    create_before_destroy = true
+  }
+}
+
+resource "aws_api_gateway_stage" "api_stage" {
+  deployment_id = aws_api_gateway_deployment.api_deployment.id
+  rest_api_id   = aws_api_gateway_rest_api.app_api.id
+  stage_name    = "v1"
+}
+
+################################################################################
+# 4. OUTPUTS (ENHANCED)
+################################################################################
+
+output "api_invoke_url" {
+  description = "The base URL to invoke the API stage."
+  value       = aws_api_gateway_stage.api_stage.invoke_url
+}
+
+output "rds_endpoint" {
+  description = "RDS instance endpoint"
+  value       = data.aws_db_instance.existing_rds.endpoint
+}
+
+output "lambda_function_name" {
+  description = "Name of the Lambda function"
+  value       = aws_lambda_function.api_handler_lambda.function_name
+}
